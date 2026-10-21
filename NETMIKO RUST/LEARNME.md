@@ -3882,6 +3882,29 @@ emitted `""` or relied on `Default`.
   `parse_chunk` (660), `finish` (671), `parse_text_to_dicts` (679),
   `row_to_object` (996). Byte-identical-to-Python results are enforced by
   the fixture suite (§18.3).
+* **The engine is not a crates.io dependency.** `Cargo.toml` and
+  `Cargo.lock` contain no TextFSM crate — the engine above is an
+  in-tree port, not a wrapper around the third-party `textfsm-rust` /
+  `textfsm-core` crates that exist on crates.io. What *is* recorded is
+  what the in-tree port guarantees (module doc lines 1–16: Python's
+  template language, state-machine semantics **and error messages**,
+  explicit `re`-compatibility shims, byte-identical fixtures, §18.3).
+  Whether the crates.io alternatives were evaluated and rejected is
+  **not** documented anywhere in the repository — treat "why not use
+  `textfsm-rust`?" as an unrecorded decision, not a vetted one.
+  For the record, the alternative as evaluated from its published
+  metadata on 2026-10-22 (`crates.io` API + its repository README):
+  MIT/Apache-2.0, the same `fancy-regex` strategy as this port, full
+  template syntax, plus a `CliTable` module that would also cover
+  `clitable.rs`; its README claims a 97.51% strict pass rate (1762/1807)
+  against the `ntc-templates` test suite with **pass/fail classification
+  identical to Python**, one documented divergence (empty `List` → `[]`
+  vs Python `[""]`), and public Python/Rust comparison harnesses.
+  Against that: pre-1.0 (v0.3.1 published 2026-02-10, no releases since),
+  a single maintainer, near-zero adoption. The question is decidable,
+  not philosophical: the §18.3 golden-fixture suite is exactly the
+  harness needed to score the crate byte-for-byte against this port, and
+  any swap should be gated on that run, not on reputation either way.
 * `clitable.rs` (495 lines): netmiko's CLI-table index resolution —
   `IndexTable` (29, parses the `index` file; `row_match` 129,
   `template_of` 147), `ParsedTable` (186), `CliTable` (223: `open` 234,

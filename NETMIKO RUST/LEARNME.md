@@ -568,7 +568,7 @@ const DEQUE_SIZE: usize = 20;
   `deque` — a direct port of the same algorithm).
 
 * `src/connection/platforms/mod.rs` line 211 builds a
-  `LazyLock<HashMap<String, &'static PlatformConfig>>` named `PLATFORM_MAP`
+  `LazyLock<HashMap<&'static str, &'static PlatformConfig>>` named `PLATFORM_MAP`
   as a fast lookup index over the static `PLATFORMS` slice (§2.3).
 
 * `src/core/util.rs`'s `show_run_command` (util.rs line 31) uses
@@ -4220,7 +4220,7 @@ A); ⚠️ implemented but without runtime/fixture coverage; ❌ not ported;
 | 22 | telnetlib transport | `TelnetTransport` `telnet/mod.rs:37` (IAC subset) | ⚠️ (no runtime tests) |
 | 23 | pyserial transport | `SerialTransport` `serial/mod.rs:15` | ⚠️ (M/S parity → None, documented) |
 | 24 | paramiko SSH transport | `SshTransport` `ssh/mod.rs:93` (russh 0.64; auth order preserved) | ⚠️ (no scripted-server tests) |
-| 25 | 414 device drivers (classes) | `PLATFORMS` table `generated.rs` (414 rows, bijection-tested) | ✅ 📌 |
+| 25 | 414 device drivers (classes) | `PLATFORMS` table `generated.rs` (414 rows, bijection-tested *against `tools/platforms.json`*; Python's full `platforms` list has 416 names — the 2 extra, `terminal_server`/`autodetect`, are in Appendix B item 7) | ✅ 📌 |
 | 26 | `utilities.py` ANSI/linefeed/split helpers | `core/util.rs` (inline Python-derived tests) | ✅ |
 | 27 | TextFSM glue `utilities.py` | `parsers/mod.rs:176` | ✅ |
 | 28 | TextFSM engine (`textfsm` pkg) | `parsers/textfsm.rs` (full port) | ✅ (golden fixtures) |
@@ -4584,6 +4584,18 @@ Recorded so nothing in this document overstates certainty.
    (snmp/ssh autodetect, encryption handling, telnet proxy,
    `send_command_w_enter`) are absent from the crate API (§27.6 rows
    32–41).
+   One platform-table gap is worth recording explicitly. The Rust
+   `PLATFORMS` table (414 rows) is a strict subset of Python's 416-name
+   `platforms` list in `ssh_dispatcher.py`; the two Python-only names are
+   `terminal_server` and `autodetect`, both of which map to
+   `TerminalServerSSH` (`ssh_dispatcher.py:484–485`). Consequently the
+   terminal-server workflow — connect with
+   `device_type="terminal_server"`, then `redispatch()` — cannot be
+   *opened* in Rust even though `redispatch()` itself is ported
+   (`dispatch.rs:227`), because `platforms::require("terminal_server")`
+   fails (`platforms/mod.rs:225`). (Diff verified by parsing
+   `generated.rs` against the pinned 4.8.0 `platforms` list; 414/414 Rust
+   names appear in Python, and these are the only two missing.)
 8. **Line numbers drift.** All `file:line` references were verified
    during writing; future edits to the repo will shift them. Symbol names
    are the durable keys.

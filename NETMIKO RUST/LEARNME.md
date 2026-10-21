@@ -2021,10 +2021,148 @@ must be available.
 
 ### 10. Trace the port: public API → device response → back
 
-This section follows one call end-to-end through the Rust code. Read it
-with `src/connection/base.rs` open.
+This section first maps where control enters and leaves the crate
+(§10.1), then follows one call end-to-end through the Rust code (§10.2
+onward). Read it with `src/connection/base.rs` open.
 
-#### 10.1 The call
+#### 10.1 Entry points and exit points
+
+Before tracing one call end to end, map where control **enters** the crate
+and where it **leaves** it. Here "entry point" means the public surface a
+caller touches first; "exit point" means what comes back to that caller —
+a value, an error, or a process exit code. Every line number below was
+read from the source while writing this section.
+
+**Entry points**
+
+1. **The builder — the front door, and it does no I/O.**
+   `ConnectHandler::new(device_type, host, username)` (dispatch.rs line 36)
+   only fills a `ConnectionParams`: no sockets, no `.await`, no failure
+   path — it returns `Self`, not `Result`. Variants on the same door:
+   `ConnectHandler::from_params(params)` (dispatch.rs line 47) and the
+   mutable `params_mut()` (dispatch.rs line 57) for callers assembling
+   parameters programmatically.
+   This is a deliberate split from Python: netmiko's `ConnectHandler` is a
+   *factory function* (ssh_dispatcher.py line 504) that validates the
+   platform — an unsupported `device_type` **raises** `ValueError`
+   (lines 507–514) — and then calls `ConnectionClass(*args, **kwargs)`
+   (line 516). The connection itself happens **inside that constructor**:
+   `BaseConnection.__init__` calls `self._open()` when `auto_connect` is
+   set (base_connection.py lines 489–491), and `_open()` =
+   `_modify_connection_params()` + `establish_connection()` +
+   `_try_session_preparation()` (lines 506–510). So in Python one
+   statement does construction, I/O and session setup, and any failure is
+   raised. In Rust the cheap half (`ConnectHandler::new`) is separate,
+   infallible, and the I/O half is `.connect().await`.
+2. **`.connect().await` — the first I/O, and the first gate.**
+   dispatch.rs line 164: `platforms::require(&params.device_type)?` runs
+   *before* any socket is opened (an unknown platform fails with
+   `UnsupportedDeviceType` and lists the supported types), then
+   `BaseConnection::open` (base.rs line 270) = `BaseConnection::new()`
+   (base.rs line 181) + `connect().await`. Callers who already hold a
+   `ConnectionParams` use the free function `netmiko::connect()`
+   (dispatch.rs line 175) — the same path — or `telnet_fallback()`
+   (dispatch.rs line 183), which wraps it with netmiko's SSH→telnet retry.
+3. **The transport fork.** `BaseConnection::connect()` (base.rs line 223)
+   matches on `params.protocol()`: `Protocol::Ssh` (base.rs line 225) →
+   `SshTransport::connect` (ssh/mod.rs line 115), telnet (base.rs line
+   236), serial (base.rs line 248). A serial attempt without the cargo
+   feature returns `NetmikoError::NotImplemented` instead of connecting
+   (base.rs line 256) — the feature flag is part of the entry contract.
+4. **Session preparation — the last gate before work.**
+   `session_preparation()` (base.rs line 1193) replays the platform's
+   `SessionStep` list: `TestChannelRead`, `SetTerminalWidth`,
+   `DisablePaging`, `SetBasePrompt`, `Enable`, `ConfigMode`, `FindPrompt`,
+   `SendCommandTiming`, … (§13). If any step fails, the session is closed
+   *before* the error propagates (base.rs lines 262–265) — a failed login
+   never leaves a half-open session behind.
+5. **Program entry points.** The `netmiko` binary: `src/main.rs` →
+   `netmiko::cli::run()` (cli/mod.rs line 221), gated by
+   `required-features = ["cli"]` (Cargo.toml lines 67–69). For library
+   consumers the entry is their own `#[tokio::main] async fn main`, in
+   either accepted shape the examples demonstrate:
+   `-> ExitCode` (examples/ssh_show_version.rs line 99) or
+   `-> netmiko::Result<()>` (examples/ssh_bench.rs line 84).
+
+**Exit points**
+
+1. **Success shapes.** Every public operation hands back `netmiko::Result<T>`:
+
+   | You called | Returns | where |
+   |---|---|---|
+   | `ConnectHandler::connect()` / `connect()` | `Result<BaseConnection>` — a live session | dispatch.rs 164 / 175 |
+   | `send_command` | `Result<String>` (echo and prompt already stripped) | base.rs 577 |
+   | `send_config_set` | `Result<String>` | base.rs 1006 |
+   | `enable` / `save_config` | `Result<String>` | base.rs 830 / 1102 |
+   | `write_channel` | `Result<()>` | base.rs 291 |
+   | `open_exec` | `Result<Box<dyn Channel>>` — the channel seam SCP uses | base.rs 1430 |
+   | `disconnect` | `Result<()>` — closes the channel **and flushes the session log** | base.rs 1418 |
+   | `get_structured_data_textfsm` | `Result<StructuredData>`: `Records(Vec<serde_json::Value>)`, or netmiko's soft-fail `Raw(String)` | parsers/mod.rs 176, 45 |
+
+2. **The error exit — one type, no exceptions.** Everything fallible
+   returns `netmiko::Result<T>` = `std::result::Result<T, NetmikoError>`
+   (error.rs line 10). `NetmikoError` (error.rs line 14) is a 17-variant
+   `thiserror` enum — `Authentication`, `Timeout`, `Connection`, `Ssh`,
+   `Telnet`, `Serial`, `Scp`, `Regex`, `Io`, `UnsupportedDeviceType`,
+   `ConfigInvalid`, `InvalidParameter`, `NotConnected`, `Read`, `Parsing`,
+   `NotImplemented`, `Generic` — with `From` conversions for
+   `regex::Error`, `std::io::Error` (via `#[from]`, error.rs lines 45 and
+   49) and `russh::Error` (error.rs line 101), so `?` crosses dependency
+   boundaries. Branch on `is_timeout()` / `is_auth()` (error.rs lines 91,
+   96), never on message text. The contrast with Python: netmiko's
+   failures are typed *exceptions* — `NetmikoTimeoutException`,
+   `NetmikoAuthenticationException` — raised from the connection layer
+   (base_connection.py lines 543, 977, 1264, …) and propagating straight
+   through the `ConnectHandler` factory; only the `ConnUnify` helper
+   re-wraps them in `ConnectionException` (ssh_dispatcher.py lines
+   604–612). Rust has no exception channel — an error travels only as the
+   `Err` half of a `Result`.
+3. **Process exit codes — the binary's exit.** `cli::run()` ends in
+   `std::process::exit(code)` (cli/mod.rs line 256) with:
+   `2` for argument-validation failures (cli/mod.rs line 226), `1` when
+   the inventory fails to load (cli/mod.rs line 205) or a device/group
+   cannot be resolved (`return 1` at cli/mod.rs lines 304, 360, 372,
+   404), otherwise `0`. **Caveat:** per-device failures are printed
+   (`output_failed_devices`, cli/mod.rs line 330) but do *not* change
+   `show`'s exit code (cli/mod.rs line 332) — a run where every device
+   failed can still exit `0`. The examples are stricter:
+   `ExitCode::SUCCESS` / `ExitCode::FAILURE` for outcomes and `2` for
+   usage errors (ssh_show_version.rs lines 145, 149, 104).
+4. **State exits.** Output leaves as `String` or `StructuredData`; the
+   session log leaves via the flush inside `disconnect()` (base.rs lines
+   1420–1422); CLI results leave as `Results = BTreeMap<String, String>`
+   (output.rs line 42) before `output_dispatcher` prints them (cli/mod.rs
+   line 319).
+
+```text
+entry                                                     exit
+─────                                                     ────
+ConnectHandler::new          (free, infallible)
+   │  from_params / params_mut  (mutate before use)
+   ▼
+.connect().await ──► platforms::require ──► BaseConnection::open
+                        │ gate                 │ BaseConnection::new  (base.rs:181)
+                        │ fails first          │ connect()            (base.rs:223)
+                        │                      │  ├─ Ssh / Telnet / Serial transport
+                        │                      │  └─ session_preparation (SessionStep loop)
+                        ▼                      ▼
+              Err(UnsupportedDeviceType)   BaseConnection ──► Result<BaseConnection>
+                                                   │
+              ┌────────────────┬───────────────────┤
+              ▼                ▼                   ▼
+        send_command     send_config_set      disconnect()
+        Result<String>   Result<String>       Result<()>  (+ log flush)
+              │                │                   │
+              └────────────────┴─────────┬─────────┘
+                                         ▼
+                    Ok(T)  ── or ──  Err(NetmikoError)     ← the library's only error exit
+
+binary path:  src/main.rs → cli::run() → process::exit(0 | 1 | 2)
+```
+
+With that map in hand, §10.2 follows one concrete call through it.
+
+#### 10.2 The call
 
 ```rust
 let mut conn = ConnectHandler::new("cisco_ios", "10.0.0.1", "admin")
@@ -2034,7 +2172,7 @@ let mut conn = ConnectHandler::new("cisco_ios", "10.0.0.1", "admin")
 let out = conn.send_command("show version", &Default::default()).await?;
 ```
 
-#### 10.2 Phase 1 — build and connect
+#### 10.3 Phase 1 — build and connect
 
 1. **`ConnectHandler::new("cisco_ios", ...)`** (dispatch.rs line 36) fills a
    `ConnectionParams` (types.rs line 88) — 40-ish `Option`-heavy fields
@@ -2092,7 +2230,7 @@ let out = conn.send_command("show version", &Default::default()).await?;
 
 From here on, `conn` is a live session whose prompt knowledge is cached.
 
-#### 10.3 Phase 2 — `send_command("show version")`
+#### 10.4 Phase 2 — `send_command("show version")`
 
 `send_command` (base.rs line 577) with default `SendOptions` (read_timeout
 10 s, last_read 2 s, cmd_verify true, strip both prompt and command,
@@ -2124,7 +2262,7 @@ normalize — base.rs line 85 area):
 
    * `read_channel` (base.rs line 300) drains the transport and performs
      netmiko's LF-normalization (a `\r\n` split across two reads must not
-     become `\r\r\n`), and prepends any stashed remainder (§10.5).
+     become `\r\r\n`), and prepends any stashed remainder (§10.6).
    * On match, `util::split_on_regex` (base.rs line 355) splits output at
      the **first** match; the matched prompt is dropped, and any text
      *after* it is pushed into `self.read_buffer` for the next call.
@@ -2145,7 +2283,7 @@ normalize — base.rs line 85 area):
 9. **Return** `Result<String>`; the caller's `?` either unwraps it or
    forwards a `Timeout` upward (§8.6).
 
-#### 10.4 The same trace as a diagram
+#### 10.5 The same trace as a diagram
 
 ```mermaid
 sequenceDiagram
@@ -2185,7 +2323,7 @@ sequenceDiagram
 Every arrow in this diagram exists as a named function in the codebase; the
 diagram is a map, the line numbers are the ground truth.
 
-#### 10.5 The read buffer: state that survives between calls
+#### 10.6 The read buffer: state that survives between calls
 
 `BaseConnection.read_buffer` (base.rs line 157 area) is the port's memory of
 "the tail of the last read that arrived after the prompt". When the next
@@ -2194,7 +2332,7 @@ without it, fast devices would lose bytes between logical commands.
 Python's equivalent is implicit in paramiko's channel buffer; here it is
 explicit state you can print in tests.
 
-#### 10.6 `send_config_set`: the other half of netmiko
+#### 10.7 `send_config_set`: the other half of netmiko
 
 `send_config_set` (base.rs line 1006) takes `&[String]` commands plus
 `ConfigSetOptions` (base.rs line 110 area: exit_config_mode, read_timeout,
@@ -2909,11 +3047,10 @@ fan-out is correct and necessary (§15.5).
 Async + bounded `buffer_unordered` (§15.7) means the CLI's throughput
 scales with device latency, not thread count. `examples/ssh_bench.rs`
 exists to *measure* this against a loopback server (`--connects`,
-`--commands`, `--parallel` flags; release profile mandatory). Honest
-status: the benchmark harness compiles and runs in release mode, but no
-benchmark numbers are recorded in this document — the loopback server
-companion had an unfixed defect at the time of writing, so any number
-claimed here would be fabricated. See Appendix B.
+`--commands`, `--parallel` flags; release profile mandatory). It has now
+been run end-to-end against a fixed server companion: the numbers, the
+method and their caveats are in §17.7. They are not flattering to the
+port in its default configuration.
 
 #### 17.6 Compile-time performance
 
@@ -2930,9 +3067,67 @@ No `#[bench]`/criterion suite exists in the repo (Appendix B records this).
 The performance-relevant constants you *can* reason about statically:
 `POLL_TIMEOUT` 25 ms (per-poll grace), the 10 ms loop delay
 (base.rs:348), `last_read` 2 s settle (timing mode) — all chosen for
-semantic fidelity to netmiko, not raw speed. If you add benchmarks, guard
-them behind a feature and a documented server; never publish numbers
-without a reproducible harness.
+semantic fidelity to netmiko, not raw speed.
+
+**Measured results (loopback, release mode).** The harness was run
+against `bench_server.py`, an `asyncssh` 2.24.1 device emulator on
+`127.0.0.1:2222` that echoes commands, answers `show` commands with a
+~100 KB blob and prompts `router1#`. Both sides use `device_type`/
+`cisco_ios`, credentials `admin`/`secret`, identical phase sizes
+(10 connects / 50 sequential `show run` / 40 parallel sessions).
+Two runs each, numbers are per-run:
+
+| side | connect avg ms | per-command ms | parallel wall s |
+|---|---|---|---|
+| Python netmiko 4.8.0, library defaults | 176.2 / 195.1 | 79.6 / 82.8 | 0.999 / 0.983 |
+| Rust netmiko-rs, library defaults | 617.0 / 595.2 | 634.4 / 630.1 | 1.903 / 1.870 |
+| Rust, `--delay-factor 0.1` | 250.4 / 238.4 | 217.9 / 220.7 | 1.095 / 1.109 |
+
+Sequential-phase throughput: Python 1.3 / 1.2 MB/s, Rust defaults
+0.2 MB/s, Rust with `--delay-factor 0.1` 0.5 MB/s. All three parallel
+runs moved exactly 4,098,160 bytes — the work is identical, only the
+timing differs.
+
+**Why the default is 3–8× slower.** Python netmiko defaults to
+`fast_cli=True`, which sets `global_delay_factor = 0.1`
+(`base_connection.py:381–382`), shrinking every `find_prompt()`/
+`clear_buffer()` sleep by 10×. netmiko-rs *stores* the same flag
+(`core/types.rs:108`, default `true` at `:183`) but **never reads it
+back** — no code converts it into a delay factor, so every sleep runs at
+full size (`base.rs:447`, `base.rs:474`). The `--delay-factor 0.1` row
+above applies Python's effective delays manually and closes most of the
+gap (per-command 634 ms → 220 ms).
+
+**What remains (≈220 ms vs ≈84 ms) was not isolated to a single cause**,
+and this document does not pretend otherwise: both implementations sleep
+25 ms per `send_command` read-loop iteration (`base_connection.py:1733`,
+`base.rs:582`), so the difference must come from how many iterations each
+side needs to observe the same bytes. Candidate causes, named but *not
+measured*: the port's 25 ms first-read grace (`POLL_TIMEOUT`,
+`ssh/mod.rs:27`) and `wait_for_data` returning an empty read on
+non-data channel messages (`ssh/mod.rs:183`), which can end a read pass
+early and cost another loop iteration. Splitting the remainder is left
+as follow-up work (§20.3). Once delays are matched, parallel throughput
+lands within ~13% of Python.
+
+**Caveats, in full.** Single machine, Windows, loopback only; one
+single-threaded `asyncssh` server shared by both clients (a common
+bottleneck that compresses differences at high concurrency); no real
+network, no real device (Appendix B item 2); harness not wired into CI
+(Appendix B item 9). Run-to-run variance was ≤5%. Reproduce with:
+
+```text
+python bench_server.py 2222 100
+python bench_python.py --port 2222 --connects 10 --commands 50 --parallel 40
+cargo run --release --example ssh_bench -- --host 127.0.0.1 --port 2222 \
+    --connects 10 --commands 50 --parallel 40 [--delay-factor 0.1]
+```
+
+The server companion required three fixes to work at all (invalid
+`session_factory` kwarg; str-vs-bytes writes; `exit()` inside the exec
+handler suppressing `CHANNEL_SUCCESS`). It lives outside the repo, so
+it is harness, not product, and the numbers above are only meaningful
+with the configuration recorded here.
 
 ---
 
@@ -3034,7 +3229,7 @@ doctests fail — documentation enforced by the compiler.
 | SCP transfers | compile-checked via doctest; no protocol-level test |
 | TTP engine (`parsers/ttp.rs`) | no fixture suite comparable to TextFSM's |
 | Genie | intentionally unimplemented — `get_structured_data_genie` (parsers/mod.rs:279) returns the Python-style "Genie and PyATS are not installed" error for cisco/linux platforms and raw output otherwise, mirroring Python's behaviour when Genie is absent |
-| benchmarks | harness exists (`examples/ssh_bench.rs`), no recorded results (§17.7, Appendix B) |
+| benchmarks | loopback harness exists **and has been run** — results and their caveats in §17.7; the headline finding is a parity gap (`fast_cli` stored but never applied), not a criterion suite |
 | CI | no `.github/` workflows in this repo (verified) |
 
 A port's credibility comes from naming these gaps, not hiding them.
@@ -3187,8 +3382,10 @@ template for real options like `read_timeout`):
   not exist in the repo — write it (§18.3).
 * **Transport tests**: a scripted fake device (local TCP listener speaking
   a canned prompt dance) for SSH/telnet read-loop coverage (§18.6).
-* **Benchmarks**: finish the loopback server companion to
-  `examples/ssh_bench.rs` and record reproducible numbers (§17.7).
+* **Benchmarks**: wire the now-working loopback harness (§17.7) into a
+  repeatable script, fix the `fast_cli` parity gap it exposed, and
+  re-measure — the current default-configuration numbers are honest but
+  unflattering.
 
 #### 20.4 Reviewing a port change: checklist
 
@@ -3389,7 +3586,7 @@ which itself loops `read_buffer_bytes`), then normalizes line endings: a
 deadline-bounded cleanup loop (up to ~1 s, 10 ms sleeps) that Python gets
 for free from paramiko's reassembly, made explicit here. It also prepends
 `read_buffer` — the stash of bytes that arrived *after* the previous
-prompt match (§10.5).
+prompt match (§10.6).
 
 `read_until_pattern` (line 335) is the direct port of
 `base_connection.py:674`, verbatim in structure:
@@ -3432,7 +3629,7 @@ while (start.elapsed().as_secs_f64() < read_timeout) || read_timeout == 0.0 {
 3. **The loop contract**: 10 ms poll delay, `read_timeout == 0.0` means
    wait forever (netmiko compatibility — a foot-gun, faithfully ported).
 4. **Split on first match, stash the tail** — the statefulness that makes
-   back-to-back `send_command` calls lossless (§10.5).
+   back-to-back `send_command` calls lossless (§10.6).
 5. **Errors carry the pattern** — the failure message is a debugging
    instrument, not a label.
 
@@ -3517,7 +3714,7 @@ default (`SendOptions::timing()`), settle detection via
 
 #### 23.8 `send_config_set` (lines 1006–1088)
 
-The config-push algorithm (details in §10.6) with two port-specific
+The config-push algorithm (details in §10.7) with two port-specific
 touches worth re-emphasizing:
 
 * `bypass_commands` (default `^banner .*$`) disables echo-verify per
@@ -3739,7 +3936,7 @@ orientation: `examples/ssh_show_version.rs` (154 lines) is the smallest
 complete program — env-var + flag parsing (lines 95–126 quoted) and
 `ExitCode`-based error UX; `examples/send_config.rs` (164 lines) adds
 multi-command input (`NETMIKO_CONFIG` env, stdin) — **it mutates device
-configuration**, so treat it accordingly; `examples/ssh_bench.rs` (131
+configuration**, so treat it accordingly; `examples/ssh_bench.rs` (140
 lines) is the benchmark harness (§17.7, Appendix B).
 
 ---
@@ -4278,7 +4475,9 @@ driver classes. §13.1.
 Ordered by the evidence in this document: scripted fake-device test suite
 (closes §18.6's biggest hole) → CI workflow institutionalizing the four
 green commands → `cargo fmt` policy incl. a generated-file exemption →
-TTP golden fixtures → benchmark completion with a fixed loopback server →
+TTP golden fixtures → acting on §17.7's benchmark finding (apply the
+`fast_cli` semantics Python applies, then re-measure: defaults are
+currently 3–8× slower than Python's) →
 decision on deferred surfaces (rows 37–41 of §27.6: snmp/ssh autodetect,
 encryption handling, telnet proxy, `send_command_w_enter`) → dependency
 hygiene (§14.1's unused five) → reconsider README's "5.x semantics"
@@ -4361,12 +4560,15 @@ Recorded so nothing in this document overstates certainty.
    the parity matrix means "green automated suite", never "tested on
    hardware". Real-device behaviour (paging quirks, banner timing, mid-
    command disconnects) remains unexercised.
-3. **Benchmark numbers: none.** A loopback harness exists
-   (`examples/ssh_bench.rs` + companion Python server scripts outside the
-   repo), but the server component had an unresolved defect, so the
-   harness was never run to completion and **no performance comparison
-   with Python is stated anywhere in this document**. §17.7 and §30.3
-   record this as work to do, not results.
+3. **Benchmark numbers: measured once, on one machine.** A loopback
+   harness exists (`examples/ssh_bench.rs` + companion server/client
+   scripts outside the repo) and was run to completion; the results are
+   in §17.7 with full caveats. They cover loopback only, against a
+   single-threaded `asyncssh` emulator — **not** real devices or networks
+   (see item 2), and not a criterion suite. The headline finding —
+   netmiko-rs never applies `fast_cli`, making its defaults 3–8× slower
+   than Python's — is a property of this configuration, not a universal
+   claim about Rust vs Python.
 4. **`cargo fmt --check` fails** (20 files, Appendix A). The codebase is
    not rustfmt-clean; formatting policy is unresolved (§19.3).
 5. **Unused declared dependencies**: `sha2`, `base64`, `indexmap`,
